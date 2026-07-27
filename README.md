@@ -6,15 +6,9 @@ Each tool lives in its own directory with a README covering usage, requirements,
 
 ## Tools
 
-### Kubernetes ([k8s/](k8s/))
+- **[k8s/](k8s/)** — tools for the Sedai components installed in Kubernetes clusters (diagnostics bundle collector, ordered component restart).
 
-- **[k8s/diagnostics/](k8s/diagnostics/)** — `sedai-diagnostics.sh`: collects a sanitized, read-only diagnostics bundle (logs, health, connectivity, TLS state) for the Sedai Kubernetes components, ready to share with Sedai support.
-- **[k8s/restart/](k8s/restart/)** — `sedai-restart.sh`: ordered restart of the Sedai Kube Spec Controller and Smart Agent with health verification between steps and a restart report bundle.
-
-## General requirements
-
-- `bash` and `kubectl` with access to the namespace where the Sedai components are installed.
-- Individual tools may use `openssl`, `helm`, or `jq` for deeper checks when available; they degrade gracefully when these are absent.
+Each platform directory has its own README listing the tools it contains; each tool directory documents usage, requirements, and safety notes.
 
 ## Support
 
