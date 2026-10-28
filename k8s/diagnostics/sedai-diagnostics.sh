@@ -35,6 +35,12 @@ SELF_TEST="false"
 
 AGENT_LABEL="app.kubernetes.io/name=sedai-smart-agent"
 CONTROLLER_LABEL="app=sedai-kube-spec-controller"
+# Namespaces opted into Spark optimization carry this label; the spec-controller
+# webhook's namespaceSelector keys off it, so which namespaces have it decides
+# where SparkApplication mutation actually fires.
+SPARK_OPT_LABEL="sedai-spark-optimization-enabled=true"
+# SparkApplication custom resource managed by the Spark operator.
+SPARKAPP_KIND="sparkapplications.sparkoperator.k8s.io"
 CONTROLLER_SVC="sedai-kube-spec-controller-svc"
 CONTROLLER_PORT="8443"
 CONTROLLER_HEALTH_PATH="/sedai/health"
@@ -201,6 +207,128 @@ run "$ROOT/cluster/namespace-overview.txt" "PVCs in $NAMESPACE" $KUBECTL get pvc
 run "$ROOT/cluster/namespace-overview.txt" "ConfigMap names in $NAMESPACE" $KUBECTL get configmaps -n "$NAMESPACE"
 # Names and types only — secret data is never collected.
 run "$ROOT/cluster/namespace-overview.txt" "Secret NAMES/types only in $NAMESPACE" $KUBECTL get secrets -n "$NAMESPACE"
+
+# Every namespace in the cluster with its Spark-optimization status: "active" only
+# when it carries the label $SPARK_OPT_LABEL (the spec-controller webhook's
+# namespaceSelector — where SparkApplications get mutated), "inactive" otherwise.
+# Sorted by status (active first). Two label-agnostic name queries drive this
+# (simple .metadata.name jsonpath); the active set is just the label-selected
+# subset — this avoids fragile jsonpath access to a dashed label key.
+SPARK_NS_FILE="$ROOT/cluster/spark-optimization-namespaces.txt"
+all_ns_out="$($KUBECTL get namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>&1)"
+all_ns_rc=$?
+active_ns="$($KUBECTL get namespaces -l "$SPARK_OPT_LABEL" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -v '^[[:space:]]*$' || true)"
+if [ "$all_ns_rc" -eq 0 ]; then
+    {
+        echo "### All namespaces with Spark-optimization status"
+        echo "### collected-at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "### status=active only when the namespace is labeled $SPARK_OPT_LABEL; sorted by status (active first)."
+        echo
+        printf '%-9s %s\n' STATUS NAMESPACE
+        printf '%s\n' "$all_ns_out" | grep -v '^[[:space:]]*$' | while IFS= read -r ns; do
+            nsstatus="inactive"
+            printf '%s\n' "$active_ns" | grep -qxF "$ns" && nsstatus="active"
+            printf '%-9s %s\n' "$nsstatus" "$ns"
+        done | sort
+    } | sanitize > "$SPARK_NS_FILE"
+    total_ns="$(printf '%s\n' "$all_ns_out" | grep -cve '^[[:space:]]*$')"
+    active_count="$(printf '%s\n' "$active_ns" | grep -cve '^[[:space:]]*$')"
+    if [ "${active_count:-0}" -gt 0 ]; then
+        check PASS "Spark-optimization namespaces" "$active_count of $total_ns namespaces active (labeled $SPARK_OPT_LABEL): $(echo $active_ns | tr '\n' ' ')"
+    else
+        check INFO "Spark-optimization namespaces" "0 of $total_ns namespaces active (Spark optimization not opted in on any namespace)"
+    fi
+elif echo "$all_ns_out" | grep -qi 'forbidden'; then
+    check INFO "Spark-optimization namespaces" "skipped (RBAC denies cluster-wide list namespaces)"
+else
+    check WARN "Spark-optimization namespaces" "could not list namespaces: $(echo "$all_ns_out" | head -c 160)"
+fi
+
+# Live SparkApplications managed by the Spark operator (cluster-wide). Anything
+# kubectl still returns has NOT been garbage-collected — i.e. it is available and
+# its post-termination TTL has not elapsed. Only non-sensitive metadata/status
+# fields are extracted; the SparkApplication .spec is deliberately never dumped
+# (its args, env, image and file paths can carry credentials).
+SPARKAPP_FILE="$ROOT/cluster/spark-applications.txt"
+
+# to_epoch <rfc3339> -> unix seconds (GNU date, then BSD date); empty on failure.
+to_epoch() {
+    local ts="$1"
+    [ -z "$ts" ] && return 0
+    date -u -d "$ts" +%s 2>/dev/null || date -u -jf '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || true
+}
+# fmt_dur <seconds> -> "1h02m03s"; "?" when unknown/negative.
+fmt_dur() {
+    local s="$1"
+    { [ -z "$s" ] || ! [ "$s" -ge 0 ] 2>/dev/null; } && { echo "?"; return; }
+    printf '%dh%02dm%02ds' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
+}
+
+# Fields are pipe-delimited, not tab-delimited: tab is IFS-whitespace, so `read`
+# would collapse empty fields (e.g. an unset terminationTime) and shift every
+# later column. A pipe never appears in these values (DNS names, RFC3339 times,
+# integers), and is preserved as a distinct empty field by `read`/awk.
+sa_rows="$($KUBECTL get "$SPARKAPP_KIND" --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.applicationState.state}{"|"}{.status.submissionAttempts}{"|"}{.status.executionAttempts}{"|"}{.status.sparkApplicationId}{"|"}{.metadata.creationTimestamp}{"|"}{.status.lastSubmissionAttemptTime}{"|"}{.status.terminationTime}{"|"}{.spec.timeToLiveSeconds}{"|"}{.status.driverInfo.podName}{"\n"}{end}' 2>&1)"
+sa_rc=$?
+if [ "$sa_rc" -ne 0 ] && echo "$sa_rows" | grep -qiE "server doesn't have a resource type|could not find the requested resource|the server could not find"; then
+    check INFO "Spark operator SparkApplications" "Spark operator CRD not installed (no $SPARKAPP_KIND resource)"
+elif [ "$sa_rc" -ne 0 ] && echo "$sa_rows" | grep -qi 'forbidden'; then
+    check INFO "Spark operator SparkApplications" "skipped (RBAC denies cluster-wide list $SPARKAPP_KIND)"
+elif [ "$sa_rc" -ne 0 ]; then
+    check WARN "Spark operator SparkApplications" "could not list: $(echo "$sa_rows" | head -c 160)"
+else
+    now="$(date -u +%s)"
+    {
+        echo "### Live SparkApplications managed by the Spark operator (cluster-wide)"
+        echo "### collected-at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "### Every row still exists in the cluster: available, TTL not yet elapsed, not garbage-collected."
+        echo "### The SparkApplication .spec is intentionally omitted (may contain credentials); only status/metadata shown."
+        echo "### DURATION = (terminationTime or now) - (start of run: lastSubmissionAttemptTime, else creationTimestamp)."
+        echo "### SUB = submissionAttempts, EXEC = executionAttempts (times the operator ran/retried this app to completion)."
+        echo
+        printf '%-18s %-40s %-14s %-4s %-5s %-11s %-21s %-21s %-8s %-30s\n' \
+            NAMESPACE NAME STATE SUB EXEC DURATION STARTED TERMINATED TTL_SEC DRIVER_POD
+        printf '%s\n' "$sa_rows" | grep -v '^[[:space:]]*$' | while IFS='|' read -r ns name state attempts execs appid created submitted terminated ttl driver; do
+            start="$submitted"; [ -z "$start" ] && start="$created"
+            s_ep="$(to_epoch "$start")"
+            if [ -n "$terminated" ]; then e_ep="$(to_epoch "$terminated")"; else e_ep="$now"; fi
+            dur="?"
+            [ -n "$s_ep" ] && [ -n "$e_ep" ] && dur="$(fmt_dur $((e_ep - s_ep)))"
+            printf '%-18s %-40s %-14s %-4s %-5s %-11s %-21s %-21s %-8s %-30s\n' \
+                "$ns" "$name" "${state:-UNKNOWN}" "${attempts:--}" "${execs:--}" "$dur" \
+                "${start:--}" "${terminated:--RUNNING-}" "${ttl:--}" "${driver:--}"
+        done
+    } | sanitize > "$SPARKAPP_FILE"
+
+    sa_count="$(printf '%s\n' "$sa_rows" | grep -cve '^[[:space:]]*$')"
+    if [ "${sa_count:-0}" -eq 0 ]; then
+        check INFO "Spark operator SparkApplications" "operator present but no live SparkApplications in the cluster"
+    else
+        sa_states="$(printf '%s\n' "$sa_rows" | awk -F'|' 'NF{c[$3==""?"UNKNOWN":$3]++} END{for(s in c) printf "%s=%d ", s, c[s]}')"
+        check PASS "Spark operator SparkApplications" "$sa_count live: ${sa_states:-n/a}(see cluster/spark-applications.txt)"
+    fi
+
+    # Timestamped Spark lifecycle events (SparkApplicationSubmitted / SparkDriverRunning
+    # / SparkApplicationCompleted / SparkApplicationFailed, ...): the best signal for
+    # WHEN and HOW OFTEN apps actually ran — including runs already garbage-collected —
+    # but bounded by the cluster's event retention (default ~1h). The COUNT column
+    # shows how many times the same event repeated.
+    # Absolute RFC3339 timestamps (not kubectl's relative "LAST SEEN" age, which is
+    # meaningless once the bundle is read later). eventTime is included because
+    # events from the newer events.k8s.io API leave firstTimestamp/lastTimestamp null.
+    SPARK_EVENTS_FILE="$ROOT/cluster/spark-application-events.txt"
+    run "$SPARK_EVENTS_FILE" "SparkApplication lifecycle events (cluster-wide, oldest->newest; absolute timestamps; bounded by event TTL)" \
+        $KUBECTL get events --all-namespaces --field-selector involvedObject.kind=SparkApplication --sort-by=.lastTimestamp \
+        -o custom-columns=FIRST_SEEN:.firstTimestamp,LAST_SEEN:.lastTimestamp,EVENT_TIME:.eventTime,COUNT:.count,TYPE:.type,REASON:.reason,NAMESPACE:.involvedObject.namespace,OBJECT:.involvedObject.name,MESSAGE:.message
+    sa_evt_count="$($KUBECTL get events --all-namespaces --field-selector involvedObject.kind=SparkApplication -o jsonpath='{range .items[*]}{.reason}{"\n"}{end}' 2>/dev/null | grep -cve '^[[:space:]]*$')"
+    if [ "${sa_evt_count:-0}" -gt 0 ]; then
+        # Per-reason tally so submitted/completed/failed counts are visible at a glance.
+        sa_evt_reasons="$($KUBECTL get events --all-namespaces --field-selector involvedObject.kind=SparkApplication -o jsonpath='{range .items[*]}{.reason}{"\n"}{end}' 2>/dev/null | grep -v '^[[:space:]]*$' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+        check PASS "SparkApplication lifecycle events" "$sa_evt_count in retention window: ${sa_evt_reasons}(see cluster/spark-application-events.txt)"
+    else
+        check INFO "SparkApplication lifecycle events" "none in the event-retention window (events expire, default ~1h)"
+    fi
+fi
 
 if [ "$HAVE_HELM" = "true" ]; then
     HELM="helm"; [ -n "$KCONTEXT" ] && HELM="helm --kube-context=$KCONTEXT"
@@ -482,14 +610,23 @@ for wh in $($KUBECTL get mutatingwebhookconfigurations -o name 2>/dev/null | gre
 
         # Registered path served over TLS? GET via the API-server proxy: the
         # handlers are POST-only, so MethodNotAllowed/404/400 still proves the
-        # TLS handshake and routing to the path work.
-        path_out="$($KUBECTL get --raw "/api/v1/namespaces/${NAMESPACE}/services/https:${CONTROLLER_SVC}:${CONTROLLER_PORT}/proxy${wh_path}" 2>&1)" && path_rc=0 || path_rc=$?
+        # TLS handshake and routing to the path work. The exact command is
+        # recorded so an operator can re-run this probe by hand (proxy syntax is
+        # scheme:name:port — "https:svc:8443", one colon, no "//").
+        path_raw="/api/v1/namespaces/${NAMESPACE}/services/https:${CONTROLLER_SVC}:${CONTROLLER_PORT}/proxy${wh_path}"
+        echo "path probe command: $KUBECTL get --raw \"${path_raw}\"" >> "$WHREG"
+        path_out="$($KUBECTL get --raw "$path_raw" 2>&1)" && path_rc=0 || path_rc=$?
         echo "path probe (${wh_path}): rc=$path_rc $(echo "$path_out" | head -c 160)" >> "$WHREG"
         if [ "$path_rc" -eq 0 ] || echo "$path_out" | grep -qiE 'MethodNotAllowed|method not allowed|the server could not find|404|400'; then
             check PASS "webhook path served over TLS ($wh)" "${wh_path} answers via API-server proxy"
         elif echo "$path_out" | grep -qi 'forbidden'; then
             check INFO "webhook path served over TLS ($wh)" "skipped (RBAC denies services/proxy)"
-        elif echo "$path_out" | grep -qiE 'no endpoints available|connection refused|timed out|timeout|TLS|x509'; then
+        # 'error trying to reach service' / ServiceUnavailable / 'address is not allowed'
+        # are the API server reporting it could not dial the backend Pod (SSRF filter
+        # rejecting the endpoint IP, no route, etc.) — the admission webhook call, which
+        # uses the same apiserver egress, will fail the same way. Classify as FAIL, not
+        # the catch-all WARN below.
+        elif echo "$path_out" | grep -qiE 'no endpoints available|connection refused|timed out|timeout|TLS|x509|error trying to reach service|address is not allowed|ServiceUnavailable'; then
             check FAIL "webhook path served over TLS ($wh)" "$(echo "$path_out" | head -c 160)"
         else
             check WARN "webhook path served over TLS ($wh)" "unexpected: $(echo "$path_out" | head -c 160)"
@@ -881,6 +1018,76 @@ analyze_logs() {
 
 analyze_logs "$ROOT/smart-agent/logs-current.log" "$AGENT_ERR_SIGS" "$AGENT_TOPIC_SIGS" "$ROOT/checks/agent-log-signature-scan.txt" "smart-agent"
 analyze_logs "$ROOT/spec-controller/logs-current.log" "$CTRL_ERR_SIGS" "-" "$ROOT/checks/controller-log-signature-scan.txt" "spec-controller"
+
+# ---------------------------------------------------------------------------
+# Consolidated per-component health (one-file answers)
+# ---------------------------------------------------------------------------
+# Roll the health signals — otherwise spread across connectivity/, the component
+# dir, and the check table — into a single file per component. This duplicates
+# data already in the bundle for convenience; summary.txt stays the authority.
+log "Assembling consolidated per-component health files..."
+
+# embed_file <path> [fallback]: print a collected file, or a note if it is absent.
+embed_file() { if [ -s "$1" ]; then cat "$1"; else echo "${2:-(not collected)}"; fi; }
+# emit_checks <name-regex>: the CHECK lines whose NAME (anchored after the status)
+# matches, so a keyword in a detail column cannot pull in an unrelated component.
+emit_checks() {
+    local out
+    out="$(printf '%s\n' ${CHECKS[@]+"${CHECKS[@]}"} | grep -E "^[A-Z]+ +($1)" 2>/dev/null || true)"
+    [ -n "$out" ] && printf '%s\n' "$out" || echo "(no matching checks recorded)"
+}
+
+# --- Smart agent ---
+{
+    echo "=== Sedai Smart Agent — consolidated health ==="
+    echo "generated : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "namespace : $NAMESPACE"
+    echo "pod       : ${AGENT_POD:-NOT FOUND}"
+    echo "deployment: ${AGENT_DEPLOY:-<unresolved>}"
+    echo
+    echo "--- Readiness & restarts ---"
+    [ -n "$AGENT_DEPLOY" ] && echo "deployment readyReplicas : $($KUBECTL get deploy "$AGENT_DEPLOY" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null || echo '?')"
+    [ -n "$AGENT_POD" ] && $KUBECTL get pod "$AGENT_POD" -n "$NAMESPACE" -o jsonpath='{range .status.containerStatuses[*]}container={.name} restarts={.restartCount} ready={.ready} state={.state}{"\n"}{end}' 2>/dev/null
+    echo
+    echo "--- Self-health endpoint ($AGENT_SELF_HEALTH_URL, in-pod) ---"
+    embed_file "$CONN/agent-self-health.txt" "(agent self-health not collected — needs pods/exec)"
+    echo
+    echo "--- Agent -> controller reachability & TLS ---"
+    embed_file "$CONN/agent-to-controller-health.txt" "(reachability probe not collected)"
+    embed_file "$CONN/agent-to-controller-health-tls-verified.txt" ""
+    echo
+    echo "--- Agent -> controller configuration ---"
+    embed_file "$CONN/agent-config-crosscheck.txt" "(config cross-check not collected)"
+    echo
+    echo "--- Related check verdicts (authority: summary.txt) ---"
+    emit_checks 'smart-agent|agent '
+} | sanitize > "$ROOT/smart-agent/health.txt"
+
+# --- Spec controller ---
+{
+    echo "=== Sedai Kube Spec Controller — consolidated health ==="
+    echo "generated : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "namespace : $NAMESPACE"
+    echo "pod       : ${CTRL_POD:-NOT FOUND}"
+    echo "deployment: ${CTRL_DEPLOY}"
+    echo
+    echo "--- Readiness & restarts ---"
+    echo "deployment readyReplicas : $($KUBECTL get deploy "$CTRL_DEPLOY" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.status.replicas}' 2>/dev/null || echo '?')"
+    [ -n "$CTRL_POD" ] && $KUBECTL get pod "$CTRL_POD" -n "$NAMESPACE" -o jsonpath='{range .status.containerStatuses[*]}container={.name} restarts={.restartCount} ready={.ready} state={.state}{"\n"}{end}' 2>/dev/null
+    echo
+    echo "--- Supporting resources ---"
+    echo "PVC sedai-kube-spec-controller-pvc : phase=$($KUBECTL get pvc sedai-kube-spec-controller-pvc -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo NotFound)"
+    echo "service $CONTROLLER_SVC endpoints  : $($KUBECTL get endpoints "$CONTROLLER_SVC" -n "$NAMESPACE" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo none)"
+    echo
+    echo "--- Health endpoint ($CONTROLLER_HEALTH_PATH via API-server proxy) ---"
+    embed_file "$CONN/controller-health-apiserver-proxy.txt" "(controller health probe not collected)"
+    echo
+    echo "--- WISB/WIRI diagnostics summary ---"
+    embed_file "$WISBDIR/diagnostics-summary.json" "(WISB diagnostics summary not collected)"
+    echo
+    echo "--- Related check verdicts (authority: summary.txt) ---"
+    emit_checks 'spec-controller|controller health|controller serves|API-server->webhook|server cert|webhook|WISB|TLS secret present'
+} | sanitize > "$ROOT/spec-controller/health.txt"
 
 # ---------------------------------------------------------------------------
 # Summary, final leak sweep, and packaging
