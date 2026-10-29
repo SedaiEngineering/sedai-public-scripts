@@ -87,6 +87,16 @@ What it still **cannot** see, because it lives on the control plane or cloud fab
 
 ## Usage
 
+### Run without downloading
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SedaiEngineering/sedai-public-scripts/main/k8s/webhook-connectivity/sedai-webhook-connectivity.sh) -n sedai
+```
+
+Pass any of the options below after the `)`, for example `-n sedai --context my-cluster --window 120`. The output is written to the current directory. Use `bash <(...)` rather than `curl ... | bash`: the script runs commands that share its standard input, which a pipe would feed from the script itself.
+
+### Options
+
 ```bash
 ./sedai-webhook-connectivity.sh [-n <namespace>] [--context <kube-context>] \
                                 [--window <seconds>] [--no-port-forward] \

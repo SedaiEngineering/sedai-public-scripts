@@ -4,6 +4,16 @@ Collects a sanitized, **read-only** diagnostics bundle for the Sedai components 
 
 ## Usage
 
+### Run without downloading
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SedaiEngineering/sedai-public-scripts/main/k8s/diagnostics/sedai-diagnostics.sh) -n sedai
+```
+
+Pass any of the options below after the `)`, for example `-n sedai --context my-cluster --since 24h`. The output is written to the current directory. Use `bash <(...)` rather than `curl ... | bash`: the script runs commands that share its standard input, which a pipe would feed from the script itself.
+
+### Options
+
 ```bash
 ./sedai-diagnostics.sh                        # defaults: namespace "sedai", current kube context
 ./sedai-diagnostics.sh -n <namespace>         # Sedai installed in a different namespace

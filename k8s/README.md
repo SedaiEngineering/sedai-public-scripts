@@ -14,6 +14,12 @@ All tools here need `bash` and `kubectl` with access to the namespace where Seda
 
 See each directory's README for full usage, output details, and safety notes.
 
+Every script can be run without downloading it first, for example:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SedaiEngineering/sedai-public-scripts/main/k8s/diagnostics/sedai-diagnostics.sh) -n sedai
+```
+
 ## Maintainers
 
 `lib/sedai-latency-lib.sh` is embedded byte-identically in `diagnostics/` and `webhook-connectivity/`, because each script must stay a single downloadable file. After editing the lib, run `lib/sync-lib.sh`. `tests/run-tests.sh` runs the offline tests (a fake `kubectl` with fixtures) and fails if an embedded copy drifts.
