@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: never let tests reach a real cluster through helm.
+echo "Error: helm disabled in offline tests" >&2
+exit 1

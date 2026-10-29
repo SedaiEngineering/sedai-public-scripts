@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Fake kubectl for offline script tests. Answers the read-only queries the
+# sedai-utils scripts make from fixtures in $FAKE_FIXTURES.
+#   FAKE_KUBECTL_MODE=ok|fail   fail: every call errors (never-abort test)
+#   FAKE_APIMETRICS=ok|forbidden
+#   FAKE_STATE=<dir>            per-run call counters (reading 1 vs 2)
+#   FAKE_API_HA=1               reading 2 comes from a different API-server instance
+#   FAKE_CTRL_OLD=1             controller v2.0.5: no latency metrics/endpoints
+#   FAKE_NO_FAILOPEN=1          API server without the fail-open counter (Kubernetes < 1.24)
+#   FAKE_CTRL_PENDING=1         the controller pod exists but is Pending
+#   FAKE_NO_CTRL=1              no controller pod: the Service has no endpoints
+#   FAKE_PF=1                   pods/portforward allowed; port-forward runs until killed
+#   FAKE_PF_NOPROXY=1           the controller pod proxy fails (forces the port-forward path)
+set -u
+FIX="${FAKE_FIXTURES:?}"; STATE="${FAKE_STATE:?}"
+mkdir -p "$STATE"
+
+if [ "${FAKE_KUBECTL_MODE:-ok}" = "fail" ]; then
+    echo "error: fake kubectl failure (connection refused)" >&2; exit 1
+fi
+
+args=()
+for a in "$@"; do
+    case "$a" in --request-timeout=*|--context=*) ;; *) args+=("$a") ;; esac
+done
+set -- "${args[@]}"
+all="$*"
+
+# next_reading <counter>: 1 on the first call, 2 afterwards.
+next_reading() {
+    local f="$STATE/$1" n=0
+    [ -f "$f" ] && n="$(cat "$f")"
+    n=$((n + 1)); echo "$n" > "$f"
+    [ "$n" -ge 2 ] && echo 2 || echo 1
+}
+
+PODWH='sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/pod|1|Ignore'
+WLWH='workload.sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/workload|1|Ignore'
+SPWH='sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/kubeflow-spark|1|Ignore'
+
+if [ "${FAKE_NO_CTRL:-}" = "1" ]; then
+    case "$all" in
+        *"get pods -l app=sedai-kube-spec-controller -o jsonpath="*|*"get endpoints sedai-kube-spec-controller-svc -o jsonpath="*) exit 0 ;;
+        *"/services/https:sedai-kube-spec-controller-svc:8443/proxy/"*)
+            echo 'Error from server (ServiceUnavailable): no endpoints available for service "sedai-kube-spec-controller-svc"' >&2; exit 1 ;;
+    esac
+fi
+if [ "${FAKE_PF:-}" = "1" ]; then
+    case "$all" in
+        "auth can-i create pods/portforward"*) echo "yes"; exit 0 ;;
+        *" port-forward "*) while :; do sleep 1; done ;;
+    esac
+fi
+if [ "${FAKE_PF_NOPROXY:-}" = "1" ]; then
+    case "$all" in *"/pods/http:"*"/proxy/metrics") echo 'Error from server (ServiceUnavailable): error trying to reach service' >&2; exit 1 ;; esac
+fi
+if [ "${FAKE_CTRL_OLD:-}" = "1" ]; then
+    case "$all" in
+        *"/proxy/sedai/health") echo '{"status":"OK","staleResources":[],"patchedResources":[],"version":"v2.0.5"}'; exit 0 ;;
+        *"/proxy/sedai/settings"|*"/proxy/sedai/instrumentation/slow-admissions"|*"/proxy/sedai/admission-latency"*)
+            echo 'Error from server (NotFound): the server could not find the requested resource' >&2; exit 1 ;;
+    esac
+fi
+
+case "$all" in
+    "config current-context") echo "fake-ctx" ;;
+    "config view"*) echo "https://fake-apiserver:6443" ;;
+    "version"*) echo "Client Version: v1.31.0"; echo "Server Version: v1.31.0" ;;
+    "get --raw /healthz") echo "ok" ;;
+    "get --raw /metrics")
+        if [ "${FAKE_APIMETRICS:-ok}" = "forbidden" ]; then
+            echo 'Error from server (Forbidden): forbidden: User "fake" cannot get path "/metrics"' >&2; exit 1
+        fi
+        r="$(next_reading api)"
+        if [ "${FAKE_API_HA:-}" = "1" ] && [ "$r" = "2" ]; then
+            sed 's/^process_start_time_seconds .*/process_start_time_seconds 1.6e+09/' "$FIX/apiserver-metrics.2.txt"
+        else
+            cat "$FIX/apiserver-metrics.$r.txt"
+        fi | if [ "${FAKE_NO_FAILOPEN:-}" = "1" ]; then grep -v '^apiserver_admission_webhook_fail_open_count'; else cat; fi ;;
+    "get --raw /api/v1/namespaces/sedai/pods/http:sedai-kube-spec-controller-abc:8080/proxy/metrics")
+        if [ "${FAKE_CTRL_OLD:-}" = "1" ]; then grep -v '^sedai_pi' "$FIX/controller-metrics.$(next_reading ctrl).txt"
+        else cat "$FIX/controller-metrics.$(next_reading ctrl).txt"; fi ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/sedai/health") cat "$FIX/health.json" ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/sedai/settings") cat "$FIX/settings.json" ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/sedai/instrumentation/slow-admissions") cat "$FIX/slow-admissions.json" ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/sedai/admission-latency?"*"endpoint=/mutate/pod"*) cat "$FIX/history-pod.json" ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/sedai/admission-latency?"*) cat "$FIX/history-empty.json" ;;
+    "get --raw /api/v1/namespaces/sedai/services/https:sedai-kube-spec-controller-svc:8443/proxy/mutate/"*)
+        echo 'Error from server (MethodNotAllowed): the server does not allow this method on the requested resource' >&2; exit 1 ;;
+    "get --raw "*) echo 'Error from server (NotFound): the server could not find the requested resource' >&2; exit 1 ;;
+    "get namespace sedai"*) echo "namespace/sedai" ;;
+    *"get secret"*) echo 'Error from server (Forbidden): secrets is forbidden' >&2; exit 1 ;;
+    "logs sedai-kube-spec-controller-abc"*)
+        printf '%s\n' \
+            '2026-10-28T10:00:00Z http: TLS handshake error from 10.0.0.1:5000: client sent an HTTP request to an HTTPS server' \
+            '2026-10-28T10:07:00Z http: TLS handshake error from 10.0.0.1:5001: client sent an HTTP request to an HTTPS server' \
+            '2026-10-28T10:14:00Z http: TLS handshake error from 10.0.0.1:5002: client sent an HTTP request to an HTTPS server' \
+            '2026-10-28T10:15:00Z ERROR owner lookup failed: pq: deadlock detected' ;;
+    "logs "*) echo "fake log line" ;;
+    "auth can-i"*) echo "no"; exit 1 ;;
+    "get mutatingwebhookconfigurations -o jsonpath="*)
+        printf '#sedai-kube-spec-controller-mutation-webhook-sedai\n%s\n%s\n#sedai-kube-spec-controller-spark-mutation-webhook-sedai\n%s\n#other-vendor\nmutate.other.io|other|other-svc|443|/mutate|10|Fail\n' "$PODWH" "$WLWH" "$SPWH" ;;
+    "get validatingwebhookconfigurations -o jsonpath="*) : ;;
+    "get mutatingwebhookconfigurations"*) printf 'NAME                                                WEBHOOK\nsedai-kube-spec-controller-mutation-webhook-sedai   ...\n' ;;
+    *"get pods -l app=sedai-kube-spec-controller -o jsonpath="*)
+        if [ "${FAKE_CTRL_PENDING:-}" = "1" ]; then printf 'sedai-kube-spec-controller-abc|Pending|\n'
+        else printf 'sedai-kube-spec-controller-abc|Running|10.0.0.5\n'; fi ;;
+    *"get deploy sedai-kube-spec-controller -o jsonpath="*"hostNetwork"*) echo "false|ClusterFirst|500m" ;;
+    *"get deploy sedai-kube-spec-controller -o jsonpath="*"env"*) printf 'SEDAI_KUBE_SPEC_CONTROLLER_PORT=8443\nSEDAI_KUBE_SPEC_CONTROLLER_DB_DRIVER_NAME=pgx\n' ;;
+    *"get pod sedai-kube-spec-controller-abc -o jsonpath="*) printf 'sedai-kube-spec-controller|2|OOMKilled\n' ;;
+    *"get endpoints sedai-kube-spec-controller-svc -o jsonpath="*) echo "10.0.0.5" ;;
+    *"get svc sedai-kube-spec-controller-svc -o jsonpath="*) echo "10.96.0.10|8443" ;;
+    "get "*|"-n "*) printf 'NAME   STATUS\nfake   Ready\n' ;;
+    *) echo "error: fake kubectl: unhandled: $all" >&2; exit 1 ;;
+esac
+exit 0

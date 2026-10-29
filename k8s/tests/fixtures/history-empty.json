@@ -1,0 +1,1 @@
+{"result":{"collectionEnabled":true,"retentionDays":7,"fromMillis":1761592800000,"toMillis":1761600000000,"stepSeconds":3600,"series":[]},"status":"OK","message":"Successfully queried admission latency"}
