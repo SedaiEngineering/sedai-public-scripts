@@ -167,6 +167,99 @@ FAKE_NO_CTRL=1 run_script conn-noctrl "$CONN" ok ok "$out" -n sedai --window 1 -
 expect "$out" "conn-noctrl: verdict names the missing pod" 'NO CONTROLLER POD'
 reject "$out" "conn-noctrl: no hostNetwork advice" 'isHostAddress'
 
+# 14. Access preflight, GKE-style /healthz, podCIDR, konnectivity logs, NEXT STEPS.
+out="$TMP/conn-gaps.txt"
+FAKE_HEALTHZ_404=1 FAKE_KONN=1 FAKE_PODCIDRS="10.0.1.0/24 10.0.0.0/29" run_script conn-gaps "$CONN" ok ok "$out" -n sedai --window 1 --no-port-forward -o "$out"
+expect "$out" "conn-gaps: access gaps listed" '^kubectl access gaps +get services/proxy -n sedai, .*get /metrics'
+expect "$out" "conn-gaps: NotFound /healthz still reachable" '^kubectl -> API server \(/healthz\) +reachable \(/healthz answered NotFound'
+reject "$out" "conn-gaps: not misread as NO-APISERVER" 'kubectl cannot reach the API server'
+expect "$out" "conn-gaps: endpoint inside a node podCIDR" 'inside a node podCIDR\? +yes'
+expect "$out" "conn-gaps: konnectivity hit counted (whole-IP match, autoscaler skipped)" 'konnectivity agent log \(1h\) +1 line\(s\) mention the controller IP .* 1 agent\(s\); 1 look like errors'
+reject "$out" "conn-gaps: 10.0.0.50 is not 10.0.0.5" 'dialing 10.0.0.50'
+expect "$out" "conn-gaps: forbidden agent recorded" 'konnectivity agent logs \(1 of 2 agents\)'
+expect "$out" "conn-gaps: NEXT STEPS re-run with access" '^1\. Re-run this script with a context that has'
+expect "$out" "conn-gaps: TLS section rendered" '17\. Webhook TLS'
+reject "$out" "conn-gaps: no network steps when drops are explained by a slow controller" 'failed calling webhook'
+
+out="$TMP/conn-podcidr-no.txt"
+FAKE_PODCIDRS="10.0.0.8/29" run_script conn-podcidr-no "$CONN" ok ok "$out" -n sedai --window 1 --no-port-forward -o "$out"
+expect "$out" "conn-podcidr-no: /29 boundary excludes .5" 'inside a node podCIDR\? +no'
+
+out="$TMP/conn-access.txt"
+FAKE_ACCESS=yes run_script conn-access "$CONN" ok ok "$out" -n sedai --window 1 --no-port-forward -o "$out"
+expect "$out" "conn-access: no gaps" '^kubectl access gaps +none$'
+
+# 15. Unexplained (lifetime-only) drops: NEXT STEPS asks for the API-server error and the network checks.
+out="$TMP/conn-next.txt"
+FAKE_API_HA=1 FAKE_WL_FAILOPEN=300 run_script conn-next "$CONN" ok ok "$out" --context gke_proj-1_us-east1_clu-a -n sedai --window 1 --no-port-forward -o "$out"
+expect "$out" "conn-next: GKE log query names the cluster" "gcloud logging read .*cluster_name=\"clu-a\".*--project proj-1"
+expect "$out" "conn-next: manual TLS check offered" 'Check the webhook TLS by hand'
+reject "$out" "conn-next: no network steps when the proxy reached the controller" 'sedai-webhook-probe'
+
+out="$TMP/conn-dial.txt"
+FAKE_PROXY_DIAL=1 FAKE_API_HA=1 FAKE_WL_FAILOPEN=300 run_script conn-dial "$CONN" ok ok "$out" --context gke_proj-1_us-east1_clu-a -n sedai --window 1 --no-port-forward -o "$out"
+expect "$out" "conn-dial: proxy DIAL-FAILED" 'API server -> service \(health proxy\) +DIAL-FAILED'
+expect "$out" "conn-dial: pod-network probe avoids the controller node" '"values":\["node-a"\]'
+expect "$out" "conn-dial: GKE firewall check" 'gcloud compute firewall-rules list --project proj-1'
+reject "$out" "conn-next: no TLS PROBLEM without caBundles to compare" 'TLS: PROBLEM'
+
+# 16. Webhook TLS checks against generated certificates (no key material is committed).
+if command -v openssl >/dev/null 2>&1; then
+    CERTS="$TMP/certs"; mkdir -p "$CERTS"
+    # mkca NAME / mkleaf NAME CA SAN DAYS
+    mkca() { openssl req -x509 -newkey rsa:2048 -nodes -keyout "$CERTS/$1.key" -out "$CERTS/$1.crt" -days 3650 -subj "/CN=$1" >/dev/null 2>&1; }
+    mkleaf() {
+        printf 'subjectAltName=DNS:%s\n' "$3" > "$CERTS/$1.ext"
+        openssl req -newkey rsa:2048 -nodes -keyout "$CERTS/$1.key" -out "$CERTS/$1.csr" -subj "/CN=$1" >/dev/null 2>&1
+        openssl x509 -req -in "$CERTS/$1.csr" -CA "$CERTS/$2.crt" -CAkey "$CERTS/$2.key" -CAcreateserial \
+            -out "$CERTS/$1.crt" -days "$4" -extfile "$CERTS/$1.ext" >/dev/null 2>&1
+    }
+    SAN=sedai-kube-spec-controller-svc.sedai.svc
+    mkca ca1; mkca ca2
+    mkleaf leaf1 ca1 "$SAN" 400; mkleaf leaf1b ca1 "$SAN" 400; mkleaf leafbad ca1 wrong.sedai.svc 400; mkleaf leafsoon ca1 "$SAN" 10
+    # tlsdir NAME SECRET-CA SECRET-LEAF BUNDLE-CA SERVED-LEAF
+    tlsdir() {
+        local d="$TMP/tls-$1"; mkdir -p "$d"
+        base64 < "$CERTS/$2.crt" | tr -d '\n' > "$d/ca.b64"
+        base64 < "$CERTS/$3.crt" | tr -d '\n' > "$d/tls.b64"
+        base64 < "$CERTS/$4.crt" | tr -d '\n' > "$d/bundle.b64"
+        cp "$CERTS/$5.crt" "$d/served.crt"; cp "$CERTS/$5.key" "$d/served.key"
+        echo "$d"
+    }
+    tls_run() { local name="$1"; shift; out="$TMP/$name.txt"; run_script "$name" "$CONN" ok ok "$out" -n sedai --window 1 -o "$out" "$@"; }
+
+    FAKE_TLS_DIR="$(tlsdir ok ca1 leaf1 ca1 leaf1)" FAKE_PF=1 FAKE_PF_TLS=1 tls_run tls-ok
+    expect "$out" "tls-ok: TLS OK" '^webhook TLS \(caBundle/Secret/served\) +OK$'
+    for c in 'caBundle <-> Secret ca.crt' 'Secret tls.crt signed by ca.crt' 'served cert <-> caBundle' 'SAN covers the Service name' 'certificate expiry' "pod serves the Secret's cert"; do
+        expect "$out" "tls-ok: $c OK" "^$c +OK"
+    done
+    expect "$out" "tls-ok: fingerprints, no PEM" 'served cert +sha256 [0-9A-F:]{20}'
+    reject "$out" "tls-ok: no PEM body in the report" 'BEGIN CERTIFICATE'
+    if [ -e "$TMP/state-tls-ok/read-tls-key" ]; then fail "tls-ok: script read tls.key"; else pass "tls-ok: tls.key never read"; fi
+
+    FAKE_TLS_DIR="$(tlsdir mismatch ca1 leaf1 ca2 leaf1)" tls_run tls-mismatch --no-port-forward
+    expect "$out" "tls-mismatch: caBundle mismatch" '^caBundle <-> Secret ca.crt +MISMATCH'
+    expect "$out" "tls-mismatch: SIGNALS PROBLEM" '^webhook TLS \(caBundle/Secret/served\) +PROBLEM'
+    expect "$out" "tls-mismatch: TLS verdict line" '^TLS: PROBLEM'
+    expect "$out" "tls-mismatch: NEXT STEPS fix" 'Fix the webhook TLS mismatch'
+
+    FAKE_TLS_DIR="$(tlsdir served ca1 leaf1 ca1 leaf1b)" FAKE_PF=1 FAKE_PF_TLS=1 tls_run tls-served-stale
+    expect "$out" "tls-served-stale: served cert still trusted" '^served cert <-> caBundle +OK'
+    expect "$out" "tls-served-stale: pod serves an old cert" "^pod serves the Secret's cert +STALE +the pod serves a different"
+
+    FAKE_TLS_DIR="$(tlsdir heur ca1 leaf1 ca1 leaf1)" FAKE_SECRET_TIME=2026-11-02T00:00:00Z tls_run tls-heuristic --no-port-forward
+    expect "$out" "tls-heuristic: Secret written after pod start" "^pod serves the Secret's cert +STALE +heuristic"
+
+    FAKE_TLS_DIR="$(tlsdir san ca1 leafbad ca1 leafbad)" tls_run tls-san --no-port-forward
+    expect "$out" "tls-san: wrong SAN" '^SAN covers the Service name +MISSING'
+
+    FAKE_TLS_DIR="$(tlsdir soon ca1 leafsoon ca1 leafsoon)" tls_run tls-soon --no-port-forward
+    expect "$out" "tls-soon: expiring warns" '^certificate expiry +EXPIRING'
+    reject "$out" "tls-soon: expiring is not a PROBLEM" 'TLS: PROBLEM'
+else
+    echo "SKIP  webhook TLS tests (openssl not installed)"
+fi
+
 # interrupt_run NAME SECONDS ENV...: start the connectivity script, send TERM after SECONDS,
 # and require it to exit within 5s with no fake port-forward left running.
 interrupt_run() {

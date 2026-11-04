@@ -15,8 +15,12 @@
 # over the timeout from the API server's metrics next to the controller's own
 # stage timings, sampled twice --window seconds apart.
 #
-# READ ONLY: only `kubectl get`/`--raw`, localhost-only `port-forward`, and `curl`
-# to that local tunnel. It never mutates the cluster. Steps that fail are listed
+# It also checks the webhook TLS chain (caBundle <-> Secret <-> served cert), which
+# kubectl access the run had, and konnectivity agent logs, and ends with NEXT STEPS.
+#
+# READ ONLY: only `kubectl get`/`--raw`/`logs`/`auth can-i`, localhost-only
+# `port-forward`, and `curl`/`openssl s_client` to that local tunnel. From the TLS
+# Secret it reads ca.crt and tls.crt, never tls.key. It never mutates the cluster. Steps that fail are listed
 # under "Not collected" and the run continues. Output is redacted.
 #
 # Usage:
@@ -28,7 +32,8 @@
 #   --self-test    run the offline analysis self-test; no cluster access
 #
 # Requirements: bash, kubectl (required); curl (used for the port-forward
-# probes — skipped if absent).
+# probes — skipped if absent); openssl (optional: certificate chain, SAN, expiry
+# and served-cert checks; without it only caBundle <-> Secret is compared).
 
 set -uo pipefail
 
@@ -959,7 +964,7 @@ analyze_row() {
 
     case "$class" in
         "DROPPING NEVER-REACHED-CONTROLLER")
-            echo "$id: DROPPING — ${fow} mutation(s) dropped in the window, and the failed calls returned before the ${to}s timeout: they never reached the controller (intermittent unreachability).${HOSTNET_FIX}" ;;
+            echo "$id: DROPPING — ${fow} mutation(s) dropped in the window, and the failed calls returned before the ${to}s timeout: they never reached the controller's handler: the API server could not dial it or rejected its TLS certificate (both are recorded as 503).${HOSTNET_FIX}" ;;
         "DROPPING CAUSE-INDETERMINATE")
             echo "$id: DROPPING — ${fow} mutation(s) dropped in the window. The ${to}s timeout falls between histogram buckets, so it cannot be told whether they timed out ($(fmt_over "$ao") over ${to}s) or never reached the controller. Check section 14 and the reachability verdict." ;;
         DROPPING*SLOW-IN-CONTROLLER|SLOW*SLOW-IN-CONTROLLER)
@@ -1183,6 +1188,331 @@ runsh() {
 # emit — append stdin to the body, sanitized
 emit() { sanitize >> "$BODY"; }
 
+# bounded <seconds> <cmd...> — run cmd, killing it after <seconds>
+bounded() {
+    local secs="$1" p w rc; shift
+    "$@" & p=$!
+    ( sleep "$secs"; kill "$p" 2>/dev/null ) & w=$!
+    wait "$p"; rc=$?
+    kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+    return "$rc"
+}
+
+# ip_in_cidrs <ipv4> <cidr...> — true when the address falls in any of the IPv4 CIDRs
+ip_in_cidrs() {
+    local ip="$1"; shift
+    case "$ip" in *.*.*.*) ;; *) return 1 ;; esac
+    printf '%s\n' "$@" | awk -F'[./]' -v ip="$ip" '
+        function n(a, b, c, d) { return ((a * 256 + b) * 256 + c) * 256 + d }
+        BEGIN { split(ip, q, "."); x = n(q[1], q[2], q[3], q[4]) }
+        NF == 5 { s = 2 ^ (32 - $5); if (int(x / s) == int(n($1, $2, $3, $4) / s)) { f = 1; exit } }
+        END { exit !f }'
+}
+
+# ---------------------------------------------------------------------------
+# Access preflight: which of the script's reads this identity may make.
+# ---------------------------------------------------------------------------
+ACCESS_GAPS=""
+# access_check <verb> <resource> <namespace|""> <needed for>
+access_check() {
+    local verb="$1" res="$2" ns="$3" why="$4" out ans
+    if [ -n "$ns" ]; then out="$($KUBECTL auth can-i "$verb" "$res" -n "$ns" 2>&1)"; else out="$($KUBECTL auth can-i "$verb" "$res" 2>&1)"; fi
+    case "$(printf '%s\n' "$out" | head -1)" in
+        yes) ans="yes" ;;
+        no*) ans="no"; ACCESS_GAPS="${ACCESS_GAPS:+$ACCESS_GAPS, }$verb $res${ns:+ -n $ns}" ;;
+        *)   ans="? ($(err_reason "$out"))" ;;
+    esac
+    printf '%-44s %-5s %s\n' "$verb $res${ns:+ -n $ns}" "$ans" "$why" >> "$WORK/access"
+}
+access_preflight() {
+    printf '%-44s %-5s %s\n' "PERMISSION" "OK?" "NEEDED FOR" > "$WORK/access"
+    access_check get    services/proxy   "$NAMESPACE"  "API server -> controller probes (sections 6, 9; health, settings)"
+    access_check get    pods/proxy       "$NAMESPACE"  "controller /metrics (section 14)"
+    access_check create pods/portforward "$NAMESPACE"  "port-forward control (section 7) and the served certificate (section 17)"
+    access_check get    secrets          "$NAMESPACE"  "webhook TLS Secret: ca.crt and tls.crt only (section 17)"
+    access_check get    pods/log         "kube-system" "Konnectivity agent logs (section 12)"
+    access_check get    /metrics         ""            "API-server admission metrics (section 13)"
+}
+
+# ---------------------------------------------------------------------------
+# Konnectivity: on clusters that tunnel API-server -> node traffic through
+# konnectivity agents, the agents dial the controller and log failed dials.
+# ---------------------------------------------------------------------------
+konn_scan() {
+    : > "$WORK/konn"; KONN_SIG="no konnectivity agents found"; KONN_NOTE=""
+    local raw pods p out pat ok=0 failed=0 freason="" hits errs
+    raw="$($KUBECTL -n kube-system get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>&1)" \
+        || { KONN_SIG="unavailable: $(err_reason "$raw")"; note_missing "konnectivity agents" "$(err_reason "$raw")"; return 0; }
+    pods="$(printf '%s\n' "$raw" | grep -E '^konnectivity-agent-' | grep -v autoscaler | head -12)"
+    [ -n "$pods" ] || return 0
+    # Whole-address match: 10.0.0.5 must not match 10.0.0.50.
+    pat="$(printf '%s\n' $ENDPOINT_IP $POD_IP | awk 'NF' | sort -u | sed 's/\./\\./g' | paste -sd'|' -)"
+    if [ -z "$pat" ]; then KONN_SIG="skipped: controller IP unknown"; return 0; fi
+    pat="(^|[^0-9.])($pat)([^0-9]|\$)"
+    for p in $pods; do
+        out="$($KUBECTL -n kube-system logs "$p" --all-containers=true --since=1h --tail=5000 2>&1)" \
+            || { failed=$((failed + 1)); freason="$(err_reason "$out")"; continue; }
+        ok=$((ok + 1))
+        printf '%s\n' "$out" | grep -E -- "$pat" | sed "s|^|[$p] |" >> "$WORK/konn"
+    done
+    if [ "$ok" -eq 0 ]; then
+        KONN_SIG="logs unavailable: $freason"; note_missing "konnectivity agent logs" "$freason"; return 0
+    fi
+    [ "$failed" -gt 0 ] && note_missing "konnectivity agent logs ($failed of $((ok + failed)) agents)" "$freason"
+    hits="$(awk 'END { print NR }' "$WORK/konn")"
+    errs="$(grep -ciE 'error|fail|refused|timeout|timed out|no route|unreachable|reset' "$WORK/konn")"
+    KONN_SIG="$hits line(s) mention the controller IP in the last 1h across $ok agent(s); $errs look like errors"
+    if [ "$errs" -gt 0 ]; then
+        KONN_NOTE="The konnectivity agents fail to dial the controller: the path from the agents to the controller pod (NetworkPolicy, node firewall, CNI) is broken."
+    elif [ "$hits" -eq 0 ]; then
+        KONN_NOTE="No agent log line mentions the controller IP. Agents usually log only failed dials, so this is weak evidence that the agent-to-pod hop works; it says nothing about the control-plane-to-agent tunnel."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Webhook TLS consistency. The API server verifies the controller's serving
+# certificate against each webhook's caBundle; any mismatch fails every call
+# (recorded as 503, then dropped by failurePolicy=Ignore). Reads only ca.crt and
+# tls.crt from the Secret (never tls.key) and reports fingerprints, never PEM
+# bodies. openssl is optional: without it only caBundle <-> Secret is compared.
+# ---------------------------------------------------------------------------
+HAVE_OPENSSL="false"; command -v openssl >/dev/null 2>&1 && HAVE_OPENSSL="true"
+if printf 'YQ==' | base64 -d >/dev/null 2>&1; then B64D="base64 -d"; else B64D="base64 -D"; fi
+b64d()      { $B64D 2>/dev/null; }
+pem_norm()  { tr -d ' \t\r\n' < "$1"; }
+is_pem()    { grep -q -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null; }
+cert_fp()   { openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null | sed 's/.*=//'; }
+cert_end()  { openssl x509 -noout -enddate -in "$1" 2>/dev/null | sed 's/^notAfter=//'; }
+cert_sans() { openssl x509 -noout -text -in "$1" 2>/dev/null | awk '/Subject Alternative Name/ { getline; gsub(/^[ \t]+/, ""); print; exit }'; }
+cert_verify() { openssl verify -CAfile "$1" "$2" 2>&1 | grep -q ': OK$'; }
+SERVED_REASON="port-forward control not run"
+
+# fetch_served_cert — the certificate the controller actually serves, read through
+# the control probe's localhost port-forward (call while it is up).
+fetch_served_cert() {
+    rm -f "$WORK/served.pem"
+    if [ "$HAVE_OPENSSL" != "true" ]; then SERVED_REASON="openssl not installed"; return 0; fi
+    bounded 8 openssl s_client -connect "127.0.0.1:${PF_LOCAL_PORT}" -servername "${CONTROLLER_SVC}.${NAMESPACE}.svc" \
+        </dev/null >"$WORK/sclient.out" 2>&1
+    if openssl x509 -in "$WORK/sclient.out" -out "$WORK/served.pem" 2>/dev/null && is_pem "$WORK/served.pem"; then
+        SERVED_REASON=""
+    else
+        rm -f "$WORK/served.pem"
+        SERVED_REASON="TLS handshake through the port-forward returned no certificate"
+    fi
+}
+
+# tls_result <check> <status> <detail> — one result row; MISMATCH/FAIL/EXPIRED/MISSING/STALE are problems
+tls_result() {
+    printf '%-34s %-9s %s\n' "$1" "$2" "$3" >> "$WORK/tls.results"
+    echo "$2" >> "$WORK/tls.status"
+    case "$2" in MISMATCH|FAIL|EXPIRED|MISSING|STALE) TLS_PROBLEM="${TLS_PROBLEM:+$TLS_PROBLEM; }$1: $2" ;; esac
+}
+
+tls_check() {
+    : > "$WORK/tls.results"; : > "$WORK/tls.status"; : > "$WORK/tls.detail"; : > "$WORK/tls.bundlefiles"; TLS_PROBLEM=""
+    local vols raw rc secret_reason="" i label bundle bad="" missing="" leaf leaf_src sans end ca_n
+    vols="$($KUBECTL -n "$NAMESPACE" get deploy "$CONTROLLER_DEPLOY" -o jsonpath='{range .spec.template.spec.volumes[*]}{.secret.secretName}{"\n"}{end}' 2>/dev/null || true)"
+    vols="$(printf '%s\n' "$vols" | grep -E '^[a-z0-9][a-z0-9.-]*$')"
+    TLS_SECRET="$(printf '%s\n' "$vols" | grep -E -- '-tls$' | head -1)"
+    [ -z "$TLS_SECRET" ] && TLS_SECRET="$(printf '%s\n' "$vols" | awk 'NF { print; exit }')"
+    [ -z "$TLS_SECRET" ] && TLS_SECRET="${CONTROLLER_DEPLOY}-tls"
+
+    # The Secret's CA and serving certificate (never tls.key).
+    HAVE_SECRET="no"; rm -f "$WORK/secret-ca.pem" "$WORK/secret-tls.pem"
+    raw="$($KUBECTL -n "$NAMESPACE" get secret "$TLS_SECRET" -o jsonpath='{.data.ca\.crt}' 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$raw" ]; then
+        printf '%s' "$raw" | b64d > "$WORK/secret-ca.pem"
+        raw="$($KUBECTL -n "$NAMESPACE" get secret "$TLS_SECRET" -o jsonpath='{.data.tls\.crt}' 2>/dev/null || true)"
+        printf '%s' "$raw" | b64d > "$WORK/secret-tls.pem"
+        is_pem "$WORK/secret-ca.pem" && HAVE_SECRET="yes" || secret_reason="Secret ca.crt is not a PEM certificate"
+    elif [ "$rc" -eq 0 ]; then secret_reason="Secret has no ca.crt"
+    else
+        case "$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')" in
+            *notfound*|*"not found"*) secret_reason="Secret $TLS_SECRET not found" ;;
+            *) secret_reason="$(err_reason "$raw")" ;;
+        esac
+    fi
+    [ "$HAVE_SECRET" = "yes" ] || note_missing "webhook TLS Secret $NAMESPACE/$TLS_SECRET" "$secret_reason"
+
+    # Every caBundle of the webhooks this controller serves.
+    raw="$($KUBECTL get mutatingwebhookconfigurations -o jsonpath='{range .items[*]}{range .webhooks[*]}{.name}{"|"}{.clientConfig.service.namespace}{"|"}{.clientConfig.service.name}{"|"}{.clientConfig.service.path}{"|"}{.clientConfig.caBundle}{"\n"}{end}{end}' 2>&1)" \
+        || { note_missing "webhook caBundles" "$(err_reason "$raw")"; raw=""; }
+    printf '%s\n' "$raw" | awk -F'|' -v s="$CONTROLLER_SVC" -v n="$NAMESPACE" '$3 == s && $2 == n { print $1 " " $4 "|" $5 }' > "$WORK/tls.bundles"
+    i=0
+    while IFS='|' read -r label bundle; do
+        i=$((i + 1))
+        if [ -z "$bundle" ]; then missing="${missing:+$missing, }$label"; continue; fi
+        printf '%s' "$bundle" | b64d > "$WORK/bundle-$i.pem"
+        is_pem "$WORK/bundle-$i.pem" || { missing="${missing:+$missing, }$label (not a PEM certificate)"; continue; }
+        printf '%s|%s\n' "$label" "$WORK/bundle-$i.pem" >> "$WORK/tls.bundlefiles"
+    done < "$WORK/tls.bundles"
+    [ -n "$missing" ] && tls_result "caBundle present" MISSING "no caBundle on: $missing"
+
+    # 1. caBundle contains the Secret's CA.
+    if [ ! -s "$WORK/tls.bundlefiles" ]; then tls_result "caBundle <-> Secret ca.crt" n/a "no caBundle to compare"
+    elif [ "$HAVE_SECRET" != "yes" ]; then tls_result "caBundle <-> Secret ca.crt" n/a "$secret_reason"
+    else
+        ca_n="$(pem_norm "$WORK/secret-ca.pem")"; bad=""
+        while IFS='|' read -r label bundle; do
+            case "$(pem_norm "$bundle")" in *"$ca_n"*) ;; *) bad="${bad:+$bad, }$label" ;; esac
+        done < "$WORK/tls.bundlefiles"
+        if [ -z "$bad" ]; then tls_result "caBundle <-> Secret ca.crt" OK "every caBundle contains the Secret's CA"
+        else tls_result "caBundle <-> Secret ca.crt" MISMATCH "caBundle does not contain the Secret's CA: $bad"; fi
+    fi
+
+    if [ "$HAVE_OPENSSL" != "true" ]; then
+        tls_result "chain / SAN / expiry / served cert" n/a "openssl not installed"
+    else
+        # 2. The Secret's serving cert is signed by the Secret's CA.
+        if [ "$HAVE_SECRET" != "yes" ]; then tls_result "Secret tls.crt signed by ca.crt" n/a "$secret_reason"
+        elif cert_verify "$WORK/secret-ca.pem" "$WORK/secret-tls.pem"; then tls_result "Secret tls.crt signed by ca.crt" OK ""
+        else tls_result "Secret tls.crt signed by ca.crt" FAIL "openssl verify failed"; fi
+
+        # 3. The served cert verifies against every caBundle — exactly the API server's check.
+        if [ ! -f "$WORK/served.pem" ]; then tls_result "served cert <-> caBundle" n/a "$SERVED_REASON"
+        elif [ ! -s "$WORK/tls.bundlefiles" ]; then tls_result "served cert <-> caBundle" n/a "no caBundle to compare"
+        else
+            bad=""
+            while IFS='|' read -r label bundle; do cert_verify "$bundle" "$WORK/served.pem" || bad="${bad:+$bad, }$label"; done < "$WORK/tls.bundlefiles"
+            if [ -z "$bad" ]; then tls_result "served cert <-> caBundle" OK "the served certificate verifies against every caBundle"
+            else tls_result "served cert <-> caBundle" MISMATCH "served certificate does not verify against: $bad"; fi
+        fi
+
+        # 4 + 5. SAN and expiry, on the served cert when we have it.
+        leaf=""; leaf_src=""
+        if [ -f "$WORK/served.pem" ]; then leaf="$WORK/served.pem"; leaf_src="served"
+        elif [ "$HAVE_SECRET" = "yes" ] && is_pem "$WORK/secret-tls.pem"; then leaf="$WORK/secret-tls.pem"; leaf_src="Secret"; fi
+        if [ -z "$leaf" ]; then
+            tls_result "SAN covers the Service name" n/a "no certificate available"
+            tls_result "certificate expiry" n/a "no certificate available"
+        else
+            sans="$(cert_sans "$leaf")"
+            if printf '%s,\n' "$sans" | grep -qF "DNS:${CONTROLLER_SVC}.${NAMESPACE}.svc,"; then
+                tls_result "SAN covers the Service name" OK "($leaf_src cert) DNS:${CONTROLLER_SVC}.${NAMESPACE}.svc"
+            else
+                tls_result "SAN covers the Service name" MISSING "($leaf_src cert) needs DNS:${CONTROLLER_SVC}.${NAMESPACE}.svc; has: ${sans:-none}"
+            fi
+            end="$(cert_end "$leaf")"
+            if ! openssl x509 -noout -checkend 0 -in "$leaf" >/dev/null 2>&1; then tls_result "certificate expiry" EXPIRED "($leaf_src cert) notAfter $end"
+            elif ! openssl x509 -noout -checkend 2592000 -in "$leaf" >/dev/null 2>&1; then tls_result "certificate expiry" EXPIRING "($leaf_src cert) notAfter $end (within 30 days)"
+            else tls_result "certificate expiry" OK "($leaf_src cert) notAfter $end"; fi
+        fi
+    fi
+
+    # 6. The pod serves the Secret's current cert (the controller loads it only at start).
+    if [ "$HAVE_SECRET" != "yes" ]; then
+        tls_result "pod serves the Secret's cert" n/a "$secret_reason"
+    elif [ -f "$WORK/served.pem" ] && is_pem "$WORK/secret-tls.pem"; then
+        if [ "$(cert_fp "$WORK/served.pem")" = "$(cert_fp "$WORK/secret-tls.pem")" ]; then tls_result "pod serves the Secret's cert" OK "fingerprints match"
+        else tls_result "pod serves the Secret's cert" STALE "the pod serves a different certificate than the Secret holds: restart the controller to load it"; fi
+    else
+        local s_times s_last
+        s_times="$($KUBECTL -n "$NAMESPACE" get secret "$TLS_SECRET" -o jsonpath='{.metadata.creationTimestamp}{" "}{.metadata.managedFields[*].time}' 2>/dev/null || true)"
+        s_last="$(printf '%s\n' $s_times | sort | tail -1)"
+        if [ -z "$s_last" ] || [ -z "${CTRL_START:-}" ]; then
+            tls_result "pod serves the Secret's cert" n/a "${SERVED_REASON}; Secret/pod timestamps unavailable"
+        elif [ "$s_last" \> "$CTRL_START" ]; then
+            tls_result "pod serves the Secret's cert" STALE "heuristic: Secret last written $s_last, after the pod started $CTRL_START; the controller loads its cert only at start"
+        else
+            tls_result "pod serves the Secret's cert" OK "heuristic: Secret last written $s_last, before the pod started $CTRL_START"
+        fi
+    fi
+
+    # Fingerprints for the report (public data, no PEM bodies).
+    if [ "$HAVE_OPENSSL" = "true" ]; then
+        {
+            echo "Secret: $NAMESPACE/$TLS_SECRET (ca.crt and tls.crt read; tls.key never read)"
+            [ "$HAVE_SECRET" = "yes" ] && echo "  Secret ca.crt  sha256 $(cert_fp "$WORK/secret-ca.pem")"
+            [ "$HAVE_SECRET" = "yes" ] && is_pem "$WORK/secret-tls.pem" && echo "  Secret tls.crt sha256 $(cert_fp "$WORK/secret-tls.pem")"
+            [ -f "$WORK/served.pem" ] && echo "  served cert    sha256 $(cert_fp "$WORK/served.pem")"
+            if [ -s "$WORK/tls.bundlefiles" ]; then
+                while IFS='|' read -r label bundle; do echo "  caBundle $label: sha256 $(cert_fp "$bundle")"; done < "$WORK/tls.bundlefiles"
+            fi
+        } > "$WORK/tls.detail"
+    else
+        echo "Secret: $NAMESPACE/$TLS_SECRET (openssl not installed: no fingerprints)" > "$WORK/tls.detail"
+    fi
+
+    if [ -n "$TLS_PROBLEM" ]; then TLS_SIG="PROBLEM: $TLS_PROBLEM"
+    elif grep -qx OK "$WORK/tls.status"; then
+        if grep -qx n/a "$WORK/tls.status"; then TLS_SIG="OK (partial: some checks n/a, see section 17)"; else TLS_SIG="OK"; fi
+    else TLS_SIG="not checked (${secret_reason:-?}; served cert: $SERVED_REASON)"; fi
+    grep -qx EXPIRING "$WORK/tls.status" && TLS_SIG="$TLS_SIG; cert expires within 30 days"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Platform (for the NEXT STEPS commands)
+# ---------------------------------------------------------------------------
+detect_platform() {
+    PLATFORM="other"; GKE_PROJECT="<project>"; GKE_LOCATION="<location>"; GKE_CLUSTER="<cluster>"
+    case "$CTX" in
+        gke_*_*_*) PLATFORM="gke"; IFS=_ read -r _ GKE_PROJECT GKE_LOCATION GKE_CLUSTER <<EOF
+$CTX
+EOF
+            ;;
+    esac
+    case "$APISERVER" in
+        *.gke.goog*|*container.googleapis.com*) PLATFORM="gke" ;;
+        *.eks.amazonaws.com*) PLATFORM="eks" ;;
+        *.azmk8s.io*) PLATFORM="aks" ;;
+    esac
+}
+
+# next_steps — numbered follow-ups for what this run could not settle ($WORK/next)
+next_steps() {
+    : > "$WORK/next"
+    local n=0 drops="no" mwc
+    # Drops the controller-side latency does not explain: never reached it, cause unknown, or lifetime-only.
+    awk -F'|' '($2 ~ /^DROPPING/ && $2 !~ /SLOW-(IN|OUTSIDE)-CONTROLLER/) || ($2 !~ /^(DROPPING|SLOW)/ && $6 ~ /DROPPED-HISTORICALLY/) { f = 1 } END { exit !f }' \
+        "$WORK/classes" 2>/dev/null && drops="yes"
+    case "$PHEALTH_CLASS" in DIAL-FAILED|TLS-ERROR) drops="yes" ;; esac
+    mwc="$(awk -F'|' 'NF { print $1; exit }' "$WORK/wh.ctrl" 2>/dev/null)"
+    step() { n=$((n + 1)); printf '%s. %s\n' "$n" "$1" >> "$WORK/next"; shift; [ $# -gt 0 ] && printf '   %s\n' "$@" >> "$WORK/next"; return 0; }
+
+    if [ -n "$ACCESS_GAPS" ]; then
+        step "Re-run this script with a context that has: $ACCESS_GAPS." \
+             "(Kubernetes RBAC, or on GKE an IAM role such as roles/container.developer; a cluster-admin context also works.)"
+    fi
+    if [ -n "$TLS_PROBLEM" ]; then
+        step "Fix the webhook TLS mismatch ($TLS_PROBLEM):" \
+             "make every caBundle on $mwc equal the Secret's ca.crt (re-render the chart against the" \
+             "existing Secret, or with GitOps ignore caBundle and the Secret's data), then restart the controller:" \
+             "kubectl -n $NAMESPACE rollout restart deploy/$CONTROLLER_DEPLOY"
+    elif [ "$drops" = "yes" ] && ! printf '%s' "$TLS_SIG" | grep -q '^OK'; then
+        step "Check the webhook TLS by hand (this run could not):" \
+             "kubectl get mutatingwebhookconfiguration $mwc -o jsonpath='{range .webhooks[*]}{.name}{\" \"}{.clientConfig.caBundle}{\"\\n\"}{end}' | while read n b; do echo \"\$n \$(echo \"\$b\" | base64 -d | openssl x509 -noout -fingerprint -sha256)\"; done" \
+             "kubectl -n $NAMESPACE get secret $TLS_SECRET -o jsonpath='{.data.ca\\.crt}' | base64 -d | openssl x509 -noout -fingerprint -sha256    # must match every line above" \
+             "kubectl -n $NAMESPACE get secret $TLS_SECRET -o jsonpath='{.data.tls\\.crt}' | base64 -d | openssl x509 -noout -enddate -text | grep -A1 'Subject Alternative Name'"
+    fi
+    if [ "$drops" = "yes" ]; then
+        case "$PLATFORM" in
+            gke) step "Read the exact webhook error from the API-server log (needs control-plane logging); 'x509' = TLS, 'dial tcp' / 'i/o timeout' = network:" \
+                      "gcloud logging read 'resource.type=\"k8s_control_plane_component\" AND resource.labels.cluster_name=\"$GKE_CLUSTER\" AND resource.labels.component_name=\"apiserver\" AND \"failed calling webhook\" AND \"$CONTROLLER_SVC\"' --project $GKE_PROJECT --freshness=1h --limit=20" ;;
+            eks) step "Read the exact webhook error from the API-server log (CloudWatch Logs Insights, log group /aws/eks/<cluster>/cluster, api logging enabled); 'x509' = TLS, 'dial tcp' / 'i/o timeout' = network:" \
+                      "fields @message | filter @logStream like /kube-apiserver/ and @message like /failed calling webhook/ and @message like /$CONTROLLER_SVC/" ;;
+            aks) step "Read the exact webhook error from the kube-apiserver diagnostic log (Log Analytics); 'x509' = TLS, 'dial tcp' / 'i/o timeout' = network:" \
+                      "AKSControlPlane | where Category == 'kube-apiserver' and Message has 'failed calling webhook' and Message has '$CONTROLLER_SVC'" ;;
+            *)   step "Read the exact webhook error from the kube-apiserver log: grep 'failed calling webhook' for $CONTROLLER_SVC; 'x509' = TLS, 'dial tcp' / 'i/o timeout' = network." ;;
+        esac
+    fi
+    if [ "$drops" = "yes" ] && [ "$PHEALTH_CLASS" != "REACHABLE" ] && [ -n "${ENDPOINT_IP%% *}" ]; then
+        step "Test the pod network from another node (creates a short-lived pod; run only if that is allowed). Works => the pod network is fine and the fault is between the control plane and the pod:" \
+             "kubectl -n $NAMESPACE run sedai-webhook-probe --rm -i --restart=Never --image=curlimages/curl:8.10.1 --overrides='{\"spec\":{\"affinity\":{\"nodeAffinity\":{\"requiredDuringSchedulingIgnoredDuringExecution\":{\"nodeSelectorTerms\":[{\"matchExpressions\":[{\"key\":\"kubernetes.io/hostname\",\"operator\":\"NotIn\",\"values\":[\"${CTRL_NODE:-<controller-node>}\"]}]}]}}}}}' -- curl -sk --max-time 5 https://${ENDPOINT_IP%% *}:${CONTROLLER_PORT}${HEALTH_PATH}"
+        case "$PLATFORM" in
+            gke) step "Check the GCP firewall lets the control plane reach the controller on tcp:${CONTROLLER_PORT} (private clusters allow only 443/10250 by default):" \
+                      "gcloud container clusters describe $GKE_CLUSTER --location $GKE_LOCATION --project $GKE_PROJECT --format='value(privateClusterConfig.masterIpv4CidrBlock,network)'" \
+                      "gcloud compute firewall-rules list --project $GKE_PROJECT --filter='direction=INGRESS AND network~<network>' --format='table(name,disabled,sourceRanges.list(),allowed[].map().firewall_rule().list(),targetTags.list())'" ;;
+            eks) step "Check the cluster security group lets the control plane reach the controller's node/pod on tcp:${CONTROLLER_PORT}." ;;
+            aks) step "Check NSGs / Azure Firewall let the control plane reach the controller's node/pod on tcp:${CONTROLLER_PORT}." ;;
+            *)   step "Check the firewall lets the control plane reach the controller's node/pod on tcp:${CONTROLLER_PORT}." ;;
+        esac
+    fi
+    [ "$n" -eq 0 ] && echo "(none — nothing in this run needs a follow-up)" >> "$WORK/next"
+    return 0
+}
+
 
 log "Sedai webhook-connectivity probe starting (namespace=$NAMESPACE, window=${WINDOW}s, read-only)"
 
@@ -1197,6 +1527,16 @@ HEALTHZ="$($KUBECTL get --raw /healthz 2>&1 || true)"
 ns_out="$($KUBECTL get namespace "$NAMESPACE" -o name 2>&1)" || note_missing "namespace $NAMESPACE" "$(err_reason "$ns_out") — in-namespace checks may be empty"
 
 discover_controller
+CTRL_NODE=""; CTRL_START=""
+if [ -n "$CTRL_POD" ]; then
+    node_raw="$($KUBECTL -n "$NAMESPACE" get pod "$CTRL_POD" -o jsonpath='{.spec.nodeName}|{.status.startTime}' 2>/dev/null || true)"
+    CTRL_NODE="${node_raw%%|*}"; CTRL_START="${node_raw#*|}"; [ "$CTRL_START" = "$node_raw" ] && CTRL_START=""
+fi
+detect_platform
+log "Access preflight (kubectl auth can-i)..."
+access_preflight
+log "Scanning konnectivity agent logs for the controller IP..."
+konn_scan
 
 # ---------------------------------------------------------------------------
 # Readings: API-server /metrics, controller /metrics, /sedai/health
@@ -1207,10 +1547,13 @@ log "Control probe: port-forward to svc/${CONTROLLER_SVC} + curl (bypasses the p
 PF_RESULT="skipped"
 if [ "$DO_PF" != "true" ]; then
     PF_RESULT="skipped (--no-port-forward)"
+    SERVED_REASON="port-forward disabled (--no-port-forward)"
 elif [ "$HAVE_CURL" != "true" ]; then
     PF_RESULT="skipped (curl not installed)"
+    SERVED_REASON="port-forward skipped (curl not installed)"
 elif ! can_portforward; then
     PF_RESULT="skipped (RBAC denies pods/portforward)"
+    SERVED_REASON="port-forward denied (RBAC)"
 else
     pf_start "svc/$CONTROLLER_SVC" "$PF_LOCAL_PORT" "$CONTROLLER_PORT"
     waited=0
@@ -1219,6 +1562,7 @@ else
         out="$(curl -sk --max-time 5 "https://127.0.0.1:${PF_LOCAL_PORT}${HEALTH_PATH}" 2>&1)"
         if [ -n "$out" ]; then PF_RESULT="$out"; break; fi
     done
+    fetch_served_cert
     pf_stop "$PF_PID"
 fi
 
@@ -1265,9 +1609,28 @@ case "$PHEALTH_CLASS" in
     TIMEOUT)     VERDICT="The API server reached the controller service but /sedai/health did not answer within 10s — the controller is overloaded or its DB is slow. See the latency lines." ;;
     TLS-ERROR)   VERDICT="TLS error between the API server and the controller — check the webhook caBundle and the controller certificate (the diagnostics bundle checks both)." ;;
     NO-SERVICE)  VERDICT="Service ${NAMESPACE}/${CONTROLLER_SVC} does not exist — the webhooks point at nothing." ;;
-    RBAC-DENIED) VERDICT="Reachability inconclusive — this account cannot use services/proxy (RBAC). Port-forward control healthy: ${PF_OK}." ;;
+    RBAC-DENIED) VERDICT="Reachability inconclusive — this account cannot use services/proxy (RBAC). Port-forward control healthy: ${PF_OK}. The dropped-mutation counts below are still valid; see NEXT STEPS." ;;
     *)           VERDICT="Reachability inconclusive — see the REPRODUCER and CONTROL sections." ;;
 esac
+
+log "Checking webhook TLS (caBundle / Secret / served certificate)..."
+tls_check
+
+# hostNetwork only fixes an unroutable pod range: offer it only when the endpoint IP
+# looks anomalous, never for a TLS fault or an IP inside a normal node podCIDR.
+NODE_CIDRS="$($KUBECTL get nodes -o jsonpath='{range .items[*]}{.spec.podCIDRs[*]}{" "}{end}' 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | tr '\n' ' ')"
+EP_IN_PODCIDR="unknown"
+if [ -n "$(printf '%s' "$NODE_CIDRS" | tr -d ' ')" ] && [ -n "${ENDPOINT_IP%% *}" ]; then
+    # shellcheck disable=SC2086
+    if ip_in_cidrs "${ENDPOINT_IP%% *}" $NODE_CIDRS; then EP_IN_PODCIDR="yes"; else EP_IN_PODCIDR="no"; fi
+fi
+if [ -n "$HOSTNET_FIX" ]; then
+    if [ -n "$TLS_PROBLEM" ]; then
+        HOSTNET_FIX=" The webhook TLS check failed (see the TLS verdict line): fix that first."
+    elif [ "$IN_19818" != "yes" ] && [ "$EP_IN_PODCIDR" = "yes" ]; then
+        HOSTNET_FIX=" The endpoint IP is inside its node's normal podCIDR, so this is not the unroutable-range case: rule out TLS and the firewall/konnectivity path first (see NEXT STEPS)."
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Per-webhook latency analysis
@@ -1364,8 +1727,15 @@ section "10. NetworkPolicy affecting the Sedai namespace"
 runsh "NetworkPolicies in $NAMESPACE"       "$K -n $NAMESPACE get networkpolicy -o wide 2>/dev/null || echo '(none / not supported)'"
 runsh "CiliumNetworkPolicies in $NAMESPACE" "$K -n $NAMESPACE get cnp,ccnp 2>/dev/null || echo '(none / not cilium)'"
 
-section "12. (OPTIONAL) Konnectivity / egress proxy present?"
+section "12. Konnectivity / egress proxy: agents, and their log lines mentioning the controller IP"
 runsh "konnectivity pods" "$K -n kube-system get pods 2>/dev/null | grep -i konnectivity || echo '(none found)'"
+{
+    echo "### agent log lines (last 1h) mentioning $(printf '%s\n' $ENDPOINT_IP $POD_IP | awk 'NF' | sort -u | paste -sd' ' -)"
+    echo "result: $KONN_SIG"
+    [ -n "$KONN_NOTE" ] && echo "$KONN_NOTE"
+    [ -s "$WORK/konn" ] && tail -20 "$WORK/konn" | cut -c1-300
+} | emit
+echo >> "$BODY"
 
 section "13. Admission latency — API-server view (per Sedai webhook)"
 render_api_view | emit
@@ -1375,6 +1745,32 @@ render_ctrl_view | emit
 
 section "15. Slow admissions (which pods/owners are slow; needs instrumentation.enabled)"
 render_slow_admissions | emit
+
+section "16. Access preflight (kubectl auth can-i for every read this script makes)"
+{
+    cat "$WORK/access"
+    echo
+    echo "gaps: ${ACCESS_GAPS:-none}"
+} | emit
+
+section "17. Webhook TLS: caBundle <-> Secret <-> served certificate"
+{
+    echo "The API server verifies the controller's serving certificate against each webhook's"
+    echo "caBundle. Any failure here fails every webhook call (counted as 503, then dropped by"
+    echo "failurePolicy=Ignore). The controller loads its certificate only at start."
+    echo
+    printf '%-34s %-9s %s\n' "CHECK" "RESULT" "DETAIL"
+    cat "$WORK/tls.results"
+    echo
+    cat "$WORK/tls.detail"
+} | emit
+
+case "$HEALTHZ" in
+    ok) HEALTHZ_SIG="ok" ;;
+    *"Error from server"*) HEALTHZ_SIG="reachable (/healthz answered $(printf '%s\n' "$HEALTHZ" | head -1 | sed -E 's/^Error from server \(([A-Za-z]+)\).*/\1/'); some managed endpoints hide it)" ;;
+    *) HEALTHZ_SIG="UNREACHABLE: $(err_reason "$HEALTHZ")" ;;
+esac
+next_steps
 
 # ---------------------------------------------------------------------------
 # Assemble the final single file: header + SIGNALS + VERDICT + body + Not collected
@@ -1390,12 +1786,14 @@ render_slow_admissions | emit
     echo
     echo "SIGNALS"
     echo "-------"
-    printf '%-42s %s\n' "kubectl -> API server (/healthz)"        "$(echo "$HEALTHZ" | head -c 60)"
+    printf '%-42s %s\n' "kubectl -> API server (/healthz)"        "$HEALTHZ_SIG"
+    printf '%-42s %s\n' "kubectl access gaps"                     "${ACCESS_GAPS:-none}"
     printf '%-42s %s\n' "controller pod(s)"                       "${CTRL_PODS:-NOT FOUND}"
     printf '%-42s %s\n' "controller version / uptime"             "${CTRL_VERSION:-?} / ${CTRL_AGE}"
     printf '%-42s %s\n' "controller pod IP"                       "${POD_IP:-?}"
     printf '%-42s %s\n' "controller endpoint IP (svc backend)"    "${ENDPOINT_IP:-?}"
     printf '%-42s %s\n' "  in reserved 198.18.0.0/15?"            "$IN_19818"
+    printf '%-42s %s\n' "  inside a node podCIDR?"                "$EP_IN_PODCIDR"
     printf '%-42s %s\n' "controller hostNetwork"                  "$HOSTNET"
     printf '%-42s %s\n' "service ClusterIP / HTTPS port"          "${CLUSTER_IP:-?} / ${CONTROLLER_PORT}"
     printf '%-42s %s\n' "webhook path / failurePolicy"            "${WHPATH:-<none found>} / ${WHPOLICY:-?}"
@@ -1404,13 +1802,20 @@ render_slow_admissions | emit
     printf '%-42s %s\n' "port-forward + curl (control, healthy?)" "$PF_OK"
     printf '%-42s %s\n' "controller health status"                "$CH_STATUS"
     printf '%-42s %s\n' "controller metrics via"                  "${CTRL_METHOD:-unavailable}"
+    printf '%-42s %s\n' "webhook TLS (caBundle/Secret/served)"    "$TLS_SIG"
+    printf '%-42s %s\n' "konnectivity agent log (1h)"             "$KONN_SIG"
     printf '%-42s %s\n' "API-server instance uptime"              "$API_AGE"
     cat "$WORK/sig"
     echo
     echo "VERDICT"
     echo "-------"
     echo "$VERDICT" | fold -s -w 78
+    [ -n "$TLS_PROBLEM" ] && echo "TLS: PROBLEM — $TLS_PROBLEM. The API server rejects the controller's certificate, so every webhook call fails before the handler and, with failurePolicy=${WHPOLICY:-?}, is dropped. See section 17 and NEXT STEPS." | fold -s -w 78
     fold -s -w 78 "$WORK/vl"
+    echo
+    echo "NEXT STEPS"
+    echo "----------"
+    cat "$WORK/next"
     echo
     echo "(Full command output below. This file is read-only-collected and redacted;"
     echo " please send the whole file to Sedai support.)"
