@@ -1023,7 +1023,7 @@ analyze_row() {
 
     case "$class" in
         "DROPPING NEVER-REACHED-CONTROLLER")
-            echo "$id: DROPPING — ${fow} mutation(s) dropped in the window, and the failed calls returned before the ${to}s timeout: they never reached the controller (intermittent unreachability).${HOSTNET_FIX}" ;;
+            echo "$id: DROPPING — ${fow} mutation(s) dropped in the window, and the failed calls returned before the ${to}s timeout: they never reached the controller's handler: the API server could not dial it or rejected its TLS certificate (both are recorded as 503).${HOSTNET_FIX}" ;;
         "DROPPING CAUSE-INDETERMINATE")
             echo "$id: DROPPING — ${fow} mutation(s) dropped in the window. The ${to}s timeout falls between histogram buckets, so it cannot be told whether they timed out ($(fmt_over "$ao") over ${to}s) or never reached the controller. Check section 14 and the reachability verdict." ;;
         DROPPING*SLOW-IN-CONTROLLER|SLOW*SLOW-IN-CONTROLLER)

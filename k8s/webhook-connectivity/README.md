@@ -22,7 +22,7 @@ The script captures **both sides of the decisive contrast**:
 1. **API server → service**, via the API-server proxy (`kubectl get --raw .../services/https:svc:8443/proxy...`). This is the same network path an admission webhook call takes.
 2. **localhost → service**, via `kubectl port-forward` + `curl`. This reaches the controller through the node's kubelet and **bypasses** the API-server-to-pod dial.
 
-If (1) fails to dial while (2) returns healthy JSON, the controller is fine and the API server cannot route to the controller's pod network. That is often a Pod IP in the reserved `198.18.0.0/15` range, or a CNI/egress path the control plane can't reach. The verdict then recommends running the controller on the host network (Helm value `sedaiPodInterceptor.isHostAddress=true`).
+If (1) fails to dial while (2) returns healthy JSON, the controller is fine and the API server cannot route to the controller's pod network. That is often a Pod IP in the reserved `198.18.0.0/15` range, or a CNI/egress path the control plane can't reach. When the endpoint IP is in the reserved range, or outside every node's `podCIDR`, the verdict recommends running the controller on the host network (Helm value `sedaiPodInterceptor.isHostAddress=true`). When the IP sits inside a normal node `podCIDR`, it points to TLS and the firewall/Konnectivity path first.
 
 Probe results are classified as follows:
 
@@ -51,7 +51,7 @@ Each webhook row gets one class, computed **only from the window**:
 
 | Class | Meaning |
 |---|---|
-| `DROPPING NEVER-REACHED-CONTROLLER` | Mutations were dropped, and the failed calls returned before the timeout, so they never reached the controller. This is intermittent unreachability. |
+| `DROPPING NEVER-REACHED-CONTROLLER` | Mutations were dropped, and the failed calls returned before the timeout, so they never reached the controller's handler. Either the API server could not dial the controller, or it rejected the controller's TLS certificate. The API server counts both as `503`; the TLS section tells them apart. |
 | `DROPPING` / `SLOW` + `SLOW-IN-CONTROLLER` | The controller itself is slow. Fix the slow stage; raising `timeoutSeconds` (max 30) only buys headroom. |
 | `DROPPING` / `SLOW` + `SLOW-OUTSIDE-CONTROLLER` | The API server sees slow calls, but the controller's timed path is fast. The time is spent in the network, TLS or the API server, or in a path the controller doesn't time (decode, HPA writes, workload DELETE). |
 | `POSSIBLY-SLOW` | The timeout falls between histogram buckets, so only a range can be given. |
@@ -72,6 +72,32 @@ On managed control planes with several API-server instances (EKS, regional GKE, 
 
 The API-server view works on every version: it needs Kubernetes 1.24+ for the fail-open counter. Whatever a cluster can't provide is listed under **Not collected** at the end of the report, with the reason. The run never stops because one source failed.
 
+### Webhook TLS
+
+The API server verifies the controller's serving certificate against each webhook's `caBundle`. If that fails, every call fails and is dropped, exactly like a network fault. Section 17 checks:
+
+| Check | Needs |
+|---|---|
+| Every Sedai webhook has a `caBundle` that contains the TLS Secret's `ca.crt` | `get secrets` |
+| The Secret's `tls.crt` is signed by its `ca.crt` | `get secrets`, `openssl` |
+| The certificate the pod **actually serves** verifies against every `caBundle` (the API server's own check) | `pods/portforward`, `curl`, `openssl` |
+| The SAN covers `<service>.<namespace>.svc`; expiry (warns within 30 days) | `openssl` |
+| The pod serves the Secret's current certificate. The controller loads it only at start, so a Secret rewritten after the pod started means a restart is needed | served cert, or Secret/pod timestamps |
+
+From the Secret it reads `ca.crt` and `tls.crt` only, never `tls.key`. The report shows SHA-256 fingerprints, never PEM bodies. Any failure adds a `TLS: PROBLEM` verdict line and a fix to NEXT STEPS.
+
+### Access preflight and NEXT STEPS
+
+Section 16 runs `kubectl auth can-i` for every read the script makes, and the `kubectl access gaps` SIGNALS row lists what was missing. The report ends its header with **NEXT STEPS**: only the follow-ups this run could not settle. These are:
+
+- re-running with the missing access;
+- the manual TLS commands;
+- the API-server log query for the exact `failed calling webhook` error, for GKE, EKS, AKS or other clusters;
+- a pod-network probe command;
+- the firewall check.
+
+The probe command creates a short-lived pod and the firewall check needs cloud access, so the script prints them for you to run rather than running them itself.
+
 ### Root-cause context
 
 The report also records:
@@ -82,8 +108,9 @@ The report also records:
 - **CNI / IPAM config:** `cilium-config`, Calico IP pools, AWS VPC-CNI ENIConfigs, kube-controller-manager CIDRs.
 - A live probe of every *Sedai* admission webhook's own path. Other vendors' webhooks are never touched.
 - `NetworkPolicy` / `CiliumNetworkPolicy` in the Sedai namespace, and whether Konnectivity is in use.
+- On Konnectivity clusters, the last hour of agent log lines that mention the controller IP. Agents dial the controller on the API server's behalf, so failed dials show up there.
 
-What it still **cannot** see, because it lives on the control plane or cloud fabric: the API server's `egress-selector` config, apiserver "failing open" logs, and VPC routes / security groups.
+What it still **cannot** see, because it lives on the control plane or cloud fabric: the API server's `egress-selector` config, the API server's own log (NEXT STEPS gives the query), and VPC routes / firewall rules / security groups.
 
 ## Usage
 
@@ -118,12 +145,17 @@ A default run takes about 75 seconds, most of it the window. Ctrl-C is safe at a
   - `services/proxy` (controller health and webhook probes);
   - `pods/proxy` (controller metrics);
   - `pods/portforward` (control probe, and the controller-metrics fallback);
-  - `get` on the API server's `/metrics` nonResourceURL (dropped-mutation and latency counts).
+  - `get` on the API server's `/metrics` nonResourceURL (dropped-mutation and latency counts);
+  - `get secrets` in the Sedai namespace (webhook TLS check);
+  - `pods/log` in `kube-system` (Konnectivity agent logs).
+
+  Section 16 of the report lists which of these the run had.
 - `curl`, only for the port-forward probes; they are skipped if `curl` is absent.
+- `openssl` (optional) for the certificate chain, SAN, expiry and served-certificate checks. Without it only `caBundle` ↔ Secret is compared.
 - On **Windows/PowerShell** the backgrounded port-forward won't work. Run with `--no-port-forward`, and do the port-forward + `curl` manually in two terminals.
 
 ## Safety
 
-- **Read-only.** Only `kubectl get`/`--raw`, localhost-only `port-forward`, and `curl` to that local tunnel. It never mutates the cluster or any controller setting.
+- **Read-only.** Only `kubectl get`/`--raw`/`logs`/`auth can-i`, localhost-only `port-forward`, and `curl`/`openssl s_client` to that local tunnel. It never mutates the cluster or any controller setting. From the TLS Secret it reads `ca.crt` and `tls.crt` only, never `tls.key`.
 - **Bounded.** Every `kubectl` call has a timeout (60s for the API server's `/metrics`, which can be large), and every `curl` has `--max-time`. Port-forwards are cleaned up on exit or interrupt.
 - **Redacted.** All output passes through a filter that strips tokens, passwords, keys, JWTs, AWS access-key IDs and basic-auth in URLs. IPs, webhook configs and metric counters are kept. The slow-admissions list includes namespace, pod and owner names, the same kind of data as the pod listings. Controller settings are tuning knobs with no secrets.

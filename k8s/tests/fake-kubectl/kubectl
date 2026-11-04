@@ -11,6 +11,15 @@
 #   FAKE_NO_CTRL=1              no controller pod: the Service has no endpoints
 #   FAKE_PF=1                   pods/portforward allowed; port-forward runs until killed
 #   FAKE_PF_NOPROXY=1           the controller pod proxy fails (forces the port-forward path)
+#   FAKE_ACCESS=yes             every `auth can-i` answers yes (default: no)
+#   FAKE_HEALTHZ_404=1          /healthz answers NotFound (as on some GKE endpoints)
+#   FAKE_PODCIDRS="<cidr> ..."  node podCIDRs
+#   FAKE_KONN=1                 konnectivity agents: one logs a failed dial, one forbids logs
+#   FAKE_TLS_DIR=<dir>          TLS Secret + caBundles from <dir>/{ca,tls,bundle}.b64
+#   FAKE_SECRET_TIME / FAKE_POD_START   Secret last-write time / controller pod start time
+#   FAKE_PROXY_DIAL=1           the API-server service proxy cannot dial the controller
+#   FAKE_WL_FAILOPEN=<n>        lifetime fail-open count of the workload webhook
+#   FAKE_PF_TLS=1               port-forward runs openssl s_server with <dir>/served.{crt,key}
 set -u
 FIX="${FAKE_FIXTURES:?}"; STATE="${FAKE_STATE:?}"
 mkdir -p "$STATE"
@@ -37,6 +46,48 @@ next_reading() {
 PODWH='sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/pod|1|Ignore'
 WLWH='workload.sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/workload|1|Ignore'
 SPWH='sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|8443|/mutate/kubeflow-spark|1|Ignore'
+
+# New-check modes (connectivity script).
+case "$all" in
+    "auth can-i create pods/portforward"*) [ "${FAKE_ACCESS:-}" = "yes" ] && { echo "yes"; exit 0; } ;;   # else FAKE_PF decides below
+    "auth can-i"*) if [ "${FAKE_ACCESS:-}" = "yes" ]; then echo "yes"; exit 0; else echo "no"; exit 1; fi ;;
+    *"/services/https:sedai-kube-spec-controller-svc:8443/proxy/"*)
+        if [ "${FAKE_PROXY_DIAL:-}" = "1" ]; then echo 'Error from server (ServiceUnavailable): error trying to reach service: dial tcp 10.0.0.5:8443: i/o timeout' >&2; exit 1; fi ;;
+    "get --raw /healthz") if [ "${FAKE_HEALTHZ_404:-}" = "1" ]; then echo 'Error from server (NotFound): the server could not find the requested resource' >&2; exit 1; fi ;;
+    *"get pod sedai-kube-spec-controller-abc -o jsonpath="*nodeName*) echo "node-a|${FAKE_POD_START:-2026-11-01T00:00:00Z}"; exit 0 ;;
+    "get nodes -o jsonpath="*podCIDRs*) [ -n "${FAKE_PODCIDRS:-}" ] && echo "$FAKE_PODCIDRS"; exit 0 ;;
+    "-n kube-system get pods -o jsonpath="*)
+        [ "${FAKE_KONN:-}" = "1" ] && printf 'coredns-1\nkonnectivity-agent-a\nkonnectivity-agent-b\nkonnectivity-agent-autoscaler-x\n'; exit 0 ;;
+    "-n kube-system logs konnectivity-agent-a"*)
+        printf '%s\n' 'I1104 10:00:00 dialing 10.0.0.50:8443 ok' 'E1104 10:00:01 dial tcp 10.0.0.5:8443: i/o timeout' 'I1104 10:00:02 tunnel connected'; exit 0 ;;
+    "-n kube-system logs konnectivity-agent-b"*)
+        echo 'Error from server (Forbidden): pods "konnectivity-agent-b" is forbidden' >&2; exit 1 ;;
+    *"get deploy sedai-kube-spec-controller -o jsonpath="*volumes*) printf 'sedai-kube-spec-controller-db\nsedai-kube-spec-controller-tls\n'; exit 0 ;;
+    "get mutatingwebhookconfigurations -o jsonpath="*caBundle*)
+        [ -n "${FAKE_TLS_DIR:-}" ] || exit 0
+        b="$(cat "$FAKE_TLS_DIR/bundle.b64")"
+        for w in 'sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|/mutate/pod' \
+                 'workload.sedai-kube-spec-controller-svc.sedai.svc|sedai|sedai-kube-spec-controller-svc|/mutate/workload'; do
+            printf '%s|%s\n' "$w" "$b"
+        done
+        printf 'mutate.other.io|other|other-svc|/mutate|\n'; exit 0 ;;
+esac
+if [ -n "${FAKE_TLS_DIR:-}" ]; then
+    case "$all" in
+        *"get secret sedai-kube-spec-controller-tls -o jsonpath="*'ca\.crt'*)  cat "$FAKE_TLS_DIR/ca.b64"; exit 0 ;;
+        *"get secret sedai-kube-spec-controller-tls -o jsonpath="*'tls\.crt'*) cat "$FAKE_TLS_DIR/tls.b64"; exit 0 ;;
+        *"get secret sedai-kube-spec-controller-tls -o jsonpath="*managedFields*) echo "2026-09-01T00:00:00Z ${FAKE_SECRET_TIME:-2026-10-01T00:00:00Z}"; exit 0 ;;
+        *"tls\\.key"*|*"tls.key"*) echo "fake kubectl: the script must never read tls.key" >&2; touch "$STATE/read-tls-key"; exit 1 ;;
+    esac
+fi
+# FAKE_PF_TLS=1: the port-forward is a real TLS server presenting $FAKE_TLS_DIR/served.crt.
+if [ "${FAKE_PF_TLS:-}" = "1" ]; then
+    case "$all" in
+        *" port-forward "*)
+            lp="${all##* }"; lp="${lp%%:*}"
+            exec openssl s_server -quiet -www -accept "$lp" -cert "$FAKE_TLS_DIR/served.crt" -key "$FAKE_TLS_DIR/served.key" ;;
+    esac
+fi
 
 if [ "${FAKE_NO_CTRL:-}" = "1" ]; then
     case "$all" in
@@ -76,7 +127,9 @@ case "$all" in
             sed 's/^process_start_time_seconds .*/process_start_time_seconds 1.6e+09/' "$FIX/apiserver-metrics.2.txt"
         else
             cat "$FIX/apiserver-metrics.$r.txt"
-        fi | if [ "${FAKE_NO_FAILOPEN:-}" = "1" ]; then grep -v '^apiserver_admission_webhook_fail_open_count'; else cat; fi ;;
+        fi | if [ -n "${FAKE_WL_FAILOPEN:-}" ]; then
+            sed "s/^\(apiserver_admission_webhook_fail_open_count{name=\"workload[^}]*}\) .*/\1 $FAKE_WL_FAILOPEN/"
+        else cat; fi | if [ "${FAKE_NO_FAILOPEN:-}" = "1" ]; then grep -v '^apiserver_admission_webhook_fail_open_count'; else cat; fi ;;
     "get --raw /api/v1/namespaces/sedai/pods/http:sedai-kube-spec-controller-abc:8080/proxy/metrics")
         if [ "${FAKE_CTRL_OLD:-}" = "1" ]; then grep -v '^sedai_pi' "$FIX/controller-metrics.$(next_reading ctrl).txt"
         else cat "$FIX/controller-metrics.$(next_reading ctrl).txt"; fi ;;
